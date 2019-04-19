@@ -44,6 +44,11 @@ function Base.iterate(phi::PhiNode, i = 1)
   phi.edges[i]=>phi.values[i], i+1
 end
 
+function Base.getindex(phi::PhiNode, b)
+  j = findfirst(c -> c == b, phi.edges)
+  return phi.values[j]
+end
+
 # SSA contruction (forked from Base for untyped code)
 
 import Core.Compiler: normalize, strip_trailing_junk!, compute_basic_blocks,
@@ -89,10 +94,22 @@ function just_construct_ssa(ci::CodeInfo, code::Vector{Any}, nargs::Int, sp)
   return ir
 end
 
-using ..IRTools
-import ..IRTools: IR, Statement, TypedMeta, Meta, block!
-
 sparams(opt::OptimizationState) = VERSION > v"1.2-" ? Any[t.val for t in opt.sptypes] : Any[opt.sp...]
+
+using ..IRTools
+import ..IRTools: IR, Variable, Statement, Branch, TypedMeta, Meta, block!,
+  unreachable, varmap
+
+function vars(ex)
+  _vars(x) = x
+  _vars(x::SSAValue) = Variable(x.id)
+  _vars(x::Argument) = IRTools.Argument(x.n)
+  prewalk(_vars, ex)
+end
+
+Branch(x::GotoNode) = Branch(nothing, x.label, [])
+Branch(x::GotoIfNot) = Branch(vars(x.cond), x.dest, [])
+Branch(x::ReturnNode) = isdefined(x, :val) ? Branch(nothing, 0, [vars(x.val)]) : unreachable
 
 function IRCode(meta::TypedMeta)
   opt = OptimizationState(meta.frame)
@@ -110,43 +127,94 @@ function IRCode(meta::Meta)
   return compact!(ir)
 end
 
+function branches_for!(ir, (from, to))
+  brs = []
+  for br in ir.blocks[from].branches
+    br.block == to && push!(brs, br)
+  end
+  if isempty(brs)
+    br = Branch(nothing, to, [])
+    push!(ir.blocks[from].branches, br)
+    push!(brs, br)
+  end
+  return brs
+end
+
+function rewrite_phis!(ir::IR)
+  for (v, st) in ir
+    ex = st.expr
+    ex isa PhiNode || continue
+    to, = IRTools.blockidx(ir, v)
+    push!(IRTools.basicblock(to).args, v)
+    for (from, arg) in zip(ex.edges, ex.values), br in branches_for!(ir, from=>to.id)
+      push!(br.args, ex[from])
+    end
+    delete!(ir, v)
+  end
+  return ir
+end
+
 function IR(ir::IRCode)
   ir2 = IR(ir.linetable, ir.argtypes)
   defs = Dict()
   isempty(ir.new_nodes) || error("IRCode must be compacted")
   for i = 1:length(ir.stmts)
     findfirst(==(i), ir.cfg.index) == nothing || block!(ir2)
-    x = push!(ir2, Statement(ir.stmts[i], ir.types[i], ir.lines[i]))
-    defs[SSAValue(i)] = x
+    if ir.stmts[i] isa Union{GotoIfNot,GotoNode,ReturnNode}
+      push!(ir2.blocks[end].branches, Branch(ir.stmts[i]))
+    else
+      x = push!(ir2, Statement(vars(ir.stmts[i]), ir.types[i], ir.lines[i]))
+      defs[Variable(i)] = x
+    end
   end
-  ssamap(x -> defs[x], ir2)
+  ir2 = varmap(x -> defs[x], ir2)
+  return rewrite_phis!(ir2)
 end
 
 IR(meta::Union{Meta,TypedMeta}) = IR(IRCode(meta))
 
-function CFG(ir::IR)
-  ls = length.(ir.blocks)
-  ranges = [i-l+1:i for (l, i) in zip(ls, cumsum(ls))]
-  index = [i[1] for i in ranges[2:end]]
-  succs = IRTools.successors.(IRTools.blocks(ir))
-  preds = [filter(j -> i in succs[j], 1:length(succs)) for i = 1:length(succs)]
-  bs = [BasicBlock(StmtRange(r), ps, ss) for (r, ps, ss) in zip(ranges, preds, succs)]
-  return CFG(bs, index)
+function unvars(ex)
+  _unvars(x) = x
+  _unvars(x::Variable) = SSAValue(x.id)
+  _unvars(x::IRTools.Argument) = Argument(x.id)
+  prewalk(_unvars, ex)
 end
 
 function IRCode(ir::IR)
-  sts = collect(ir)
-  lines = Int32[st.line for (_, st) in sts]
-  types = Any[st.type for (_, st) in sts]
-  map = Dict{SSAValue,SSAValue}()
-  for (i, (j, _)) in enumerate(sts)
-    j == nothing && continue
-    map[j] = SSAValue(i)
+  defs = Dict()
+  stmts, types, lines = [], [], Int32[]
+  index = Int[]
+  for b in IRTools.blocks(ir)
+    @assert isempty(IRTools.basicblock(b).args)
+    for (v, st) in b
+      defs[v] = Variable(length(stmts)+1)
+      ex = varmap(x -> get(defs, x, x), st.expr) |> unvars
+      push!(stmts, ex)
+      push!(types, st.type)
+      push!(lines, st.line)
+    end
+    for br in IRTools.basicblock(b).branches
+      if IRTools.isreturn(br)
+        x = get(defs, br.args[1], br.args[1]) |> unvars
+        push!(stmts, ReturnNode(x))
+      elseif br.condition == nothing
+        push!(stmts, GotoNode(br.block))
+      else
+        cond = get(defs, br.condition, br.condition) |> unvars
+        push!(stmts, GotoIfNot(cond, br.block))
+      end
+      push!(types, Any); push!(lines, 0)
+    end
+    push!(index, length(stmts)+1)
   end
-  stmts = [ssamap(x -> map[x], st.expr) for (_, st) in sts]
+  ranges = StmtRange.([1, index[1:end-1]...], index.-1)
+  succs = IRTools.successors.(IRTools.blocks(ir))
+  preds = [filter(j -> i in succs[j], 1:length(succs)) for i = 1:length(succs)]
+  bs = BasicBlock.(ranges, preds, succs)
+  cfg = CFG(bs, index)
   flags = [0x00 for _ in stmts]
   sps = VERSION > v"1.2-" ? [] : Core.svec()
-  IRCode(stmts, types, lines, flags, CFG(ir), ir.lines, ir.args, [], sps)
+  IRCode(stmts, types, lines, flags, cfg, ir.lines, ir.args, [], sps)
 end
 
 end

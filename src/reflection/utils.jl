@@ -4,25 +4,26 @@ end
 
 Base.show(io::IO, s::Slot) = print(io, "@", s.id)
 
+spatslot(b, i) = Slot(Symbol(:spat_, b, :_, i))
+
 function slots!(ir::IR)
-  n = 0
-  amap = Dict()
-  for (x, st) in ir
-    st.expr isa PhiNode || continue
-    slot = ir[x] = Slot(Symbol(:phi, n += 1))
-    for (p, y) in st.expr
-      if y isa SSAValue
-        insertafter!(ir, y, :($slot = $y))
-        amap[y] = slot
-      else
-        push!(block(ir, p), :($slot = $y))
+  slots = Dict()
+  for b in blocks(ir)
+    # Block arguments
+    for (i, var) in enumerate(basicblock(b).args)
+      slots[var] = spatslot(b.id, i)
+    end
+    empty!(basicblock(b).args)
+    # Branches
+    for br in basicblock(b).branches
+      isreturn(br) && continue
+      for (i, val) in enumerate(br.args)
+        push!(b, :($(spatslot(br.block, i)) = $val))
       end
+      empty!(br.args)
     end
   end
-  map(ir) do x
-    isexpr(x, :(=)) && return x
-    prewalk(x -> get(amap, x, x), x)
-  end
+  return varmap(x -> get(slots, x, x), ir)
 end
 
 using Core.Compiler: CodeInfo, SlotNumber
@@ -42,10 +43,10 @@ function slots!(ci::CodeInfo)
 end
 
 struct NewArg
-  n::Int
+  id::Int
 end
 
-function varargs!(meta, ir::IR, n = 1)
+function varargs!(meta, ir::IR, n = 0)
   isva = meta.method.isva
   Ts = widenconst.(ir.args[n+1:end])
   args = !isva ?
@@ -67,14 +68,14 @@ function varargs!(meta, ir::IR, n = 1)
     arg = xcall(Base, :getfield, NewArg(n+1), i)
     argmap[Argument(i+n)] = pushfirst!(ir, Statement(arg, type = Ts[i]))
   end
-  unnew(x::NewArg) = Argument(x.n); unnew(x) = x
+  unnew(x::NewArg) = Argument(x.id); unnew(x) = x
   map(ir) do x
     prewalk(x -> unnew(x isa Argument ? get(argmap, x, x) : x), x)
   end
 end
 
 function spliceargs!(meta, ir::IR, args...)
-  ir = argmap(x -> Argument(x.n + length(args)), ir)
+  ir = argmap(x -> Argument(x.id + length(args)), ir)
   for (name, T) in reverse(args)
     pushfirst!(ir.args, T)
     pushfirst!(meta.code.slotnames, name)
@@ -91,39 +92,3 @@ function update!(meta, ir::Core.Compiler.IRCode)
 end
 
 update!(meta, ir::IR) = update!(meta, Core.Compiler.IRCode(slots!(ir)))
-
-# Test / example function
-@generated function roundtrip(f, args...)
-  m = meta(Tuple{f,args...})
-  ir = IR(m)
-  ir = varargs!(m, ir)
-  argnames!(m, :f, :args)
-  ir = spliceargs!(m, ir, (Symbol("#self#"), typeof(roundtrip)))
-  return update!(m, ir)
-end
-
-Base.isconst(g::GlobalRef) = isconst(g.mod, g.name)
-Base.getindex(g::GlobalRef) = getfield(g.mod, g.name)
-
-_typeof(x) = typeof(x)
-_typeof(x::GlobalRef) = isconst(x) ? typeof(x[]) : Any
-
-isprimitive(x) =
-  _typeof(x) <: Union{Core.IntrinsicFunction,Core.Builtin}
-
-isprimitive(ir, f) = isprimitive(f)
-isprimitive(ir, f::SSAValue) = isprimitive(ir[f].expr)
-
-@generated function passthrough(f, args...)
-  m = meta(Tuple{f,args...})
-  m == nothing && return :(f(args...))
-  ir = IR(m)
-  for (x, st) in ir
-    (isexpr(st.expr, :call) && !isprimitive(ir, st.expr.args[1])) || continue
-    ir[x] = xcall(IRTools, :passthrough, st.expr.args...)
-  end
-  ir = varargs!(m, ir)
-  argnames!(m, :f, :args)
-  ir = spliceargs!(m, ir, (Symbol("#self#"), typeof(passthrough)))
-  return update!(m, ir)
-end

@@ -8,12 +8,13 @@ export @code_ir
 include("reflection/reflection.jl")
 
 include("ir/ir.jl")
+include("ir/utils.jl")
 include("ir/wrap.jl")
 include("ir/print.jl")
 include("ir/parse.jl")
-include("ir/utils.jl")
 
 include("reflection/utils.jl")
+include("reflection/dynamo.jl")
 
 include("interpret.jl")
 
