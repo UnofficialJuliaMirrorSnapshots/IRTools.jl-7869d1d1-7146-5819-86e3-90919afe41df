@@ -4,9 +4,9 @@ function definitions(b::Block)
 end
 
 function usages(b::Block)
-  uses = Set{Union{Variable,Argument}}()
+  uses = Set{Variable}()
   prewalk(b) do x
-    x isa Union{Variable,Argument} && push!(uses, x)
+    x isa Variable && push!(uses, x)
     return x
   end
   return uses
@@ -58,11 +58,7 @@ function verify(ir::IR)
   for (b, ds) in doms
     defs = union(definitions.(ds)...)
     for x in setdiff(usages(b), defs)
-      if x isa Argument
-        @assert x.id <= length(ir.args) "Used argument $x of $(length(ir.args))"
-      else
-        error("Variable $x in block $(b.id) is not defined.")
-      end
+      error("Variable $x in block $(b.id) is not defined.")
     end
   end
   return
@@ -74,7 +70,7 @@ function renumber(ir)
     ex = st.expr
     if isbits(ex) # Trivial expressions can be inlined
       delete!(p, v)
-      substitute!(p, v, ex)
+      substitute!(p, v, substitute(p, ex))
     end
   end
   return finish(p)
@@ -92,13 +88,7 @@ function merge_returns!(ir)
   return ir
 end
 
-function merge_entry!(ir)
-  isempty(predecessors(block(ir, 1))) && return ir
-  block!(ir, 1)
-  return ir
-end
-
-function allspats!(ir::IR)
+function expand!(ir::IR)
   worklist = blocks(ir)
   spats = Dict(b => Dict() for b in blocks(ir))
   while !isempty(worklist)
@@ -118,7 +108,7 @@ function allspats!(ir::IR)
   return ir
 end
 
-function trimspats!(ir::IR)
+function prune!(ir::IR)
   worklist = blocks(ir)
   while !isempty(worklist)
     b = popfirst!(worklist)
@@ -134,6 +124,45 @@ function trimspats!(ir::IR)
       for c in successors(b)
         c in worklist || push!(worklist, c)
       end
+    end
+  end
+  return ir
+end
+
+function ssa!(ir::IR)
+  defs = Dict(b => Dict{Slot,Any}() for b in 1:length(ir.blocks))
+  todo = Dict(b => Dict{Int,Vector{Slot}}() for b in 1:length(ir.blocks))
+  function reaching(b, v)
+    haskey(defs[b.id], v) && return defs[b.id][v]
+    b.id == 1 && return undef
+    x = defs[b.id][v] = argument!(b, insert = false)
+    for pred in predecessors(b)
+      if pred.id < b.id
+        for br in branches(pred, b)
+          push!(br.args, reaching(pred, v))
+        end
+      else
+        push!(get!(todo[pred.id], b.id, Slot[]), v)
+      end
+    end
+    return x
+  end
+  for b in blocks(ir)
+    rename(ex) = prewalk(x -> x isa Slot ? reaching(b, x) : x, ex)
+    for (v, st) in b
+      ex = st.expr
+      if isexpr(ex, :(=))
+        defs[b.id][ex.args[1]] = rename(ex.args[2])
+        delete!(ir, v)
+      else
+        ir[v] = rename(ex)
+      end
+    end
+    for i = 1:length(basicblock(b).branches)
+      basicblock(b).branches[i] = rename(basicblock(b).branches[i])
+    end
+    for (succ, ss) in todo[b.id], br in branches(b, succ)
+      append!(br.args, [reaching(b, v) for v in ss])
     end
   end
   return ir

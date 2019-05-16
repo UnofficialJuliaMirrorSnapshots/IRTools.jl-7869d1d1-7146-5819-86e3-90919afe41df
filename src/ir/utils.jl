@@ -31,7 +31,7 @@ function map!(f, b::Block)
 end
 
 function map(f, ir::IR)
-  IR(ir.defs, map.(f, ir.blocks), ir.lines, ir.args)
+  IR(ir.defs, map.(f, ir.blocks), ir.lines)
 end
 
 function map!(f, ir::IR)
@@ -43,6 +43,7 @@ end
 
 walk(st::Statement, inner, outer) = Statement(st, inner(st.expr))
 walk(bb::BasicBlock, inner, outer) = map(inner, bb)
+walk(bb::Branch, inner, outer) = map(inner, bb)
 walk(b::Block, inner, outer) = walk(basicblock(b), inner, outer)
 
 walk(ir::IR, inner, outer) = outer(map(inner, ir))
@@ -52,11 +53,8 @@ postwalk!(f, ir::Union{IR,Block}) = map!(x -> postwalk(f, x), ir)
 
 varmap(f, x) = prewalk(x -> x isa Variable ? f(x) : x, x)
 
-argmap(f, x) = prewalk(x -> x isa Argument ? f(x) : x, x)
-
 exprtype(x::GlobalRef) = isconst(x.mod, x.name) ? Typeof(getfield(x.mod, x.name)) : Any
 
-exprtype(ir::IR, x::Argument) = widenconst(ir.args[x.id])
 exprtype(ir::IR, x::GlobalRef) = exprtype(x)
 exprtype(ir::IR, x::QuoteNode) = Typeof(x.value)
 exprtype(ir::IR, x::Expr) = error(x)
