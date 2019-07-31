@@ -1,5 +1,5 @@
 using IRTools, Test
-using IRTools: @dynamo, IR, meta, isexpr, xcall
+using IRTools: @dynamo, IR, meta, isexpr, xcall, self, insertafter!, recurse!
 using MacroTools
 
 @dynamo roundtrip(a...) = IR(a...)
@@ -7,16 +7,20 @@ using MacroTools
 @dynamo function passthrough(a...)
   ir = IR(a...)
   ir == nothing && return
-  for (x, st) in ir
-    isexpr(st.expr, :call) || continue
-    ir[x] = xcall(Main, :passthrough, st.expr.args...)
-  end
+  recurse!(ir)
   return ir
 end
 
 add(a, b) = a+b
 @test roundtrip(add, 2, 3) == 5
 @test passthrough(add, 2, 3) == 5
+
+@test @code_ir(passthrough, add(2, 3)) isa IR
+
+IRTools.refresh(roundtrip)
+
+add(a, b) = a*b
+@test roundtrip(add, 2, 3) == 6
 
 relu(x) = x > 0 ? x : 0
 @test roundtrip(relu, 1) == 1
@@ -44,3 +48,27 @@ foo(x) = y = x > 0 ? x + 1 : x - 1
 end
 
 @test mullify(prod, [5, 10]) == 15
+
+@dynamo err(a...) = 0//0
+
+@test_throws IRTools.CompileError err(+, 2, 3)
+
+mutable struct Context
+  calls::Int
+end
+
+@dynamo function (cx::Context)(a...)
+  ir = IR(a...)
+  ir == nothing && return
+  recurse!(ir)
+  calls = pushfirst!(ir, xcall(:getfield, self, QuoteNode(:calls)))
+  calls = insertafter!(ir, calls, xcall(:+, calls, 1))
+  insertafter!(ir, calls, xcall(:setfield!, self, QuoteNode(:calls), calls))
+  return ir
+end
+
+@code_lowered Context(0)(add, 2, 3)
+
+cx = Context(0)
+@test cx(add, 2, 3.0) == 6
+@test cx.calls > 5

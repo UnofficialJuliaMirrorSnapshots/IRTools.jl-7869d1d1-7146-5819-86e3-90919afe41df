@@ -40,10 +40,10 @@ struct Statement
   line::Int
 end
 
-Statement(x; type = Any, line = 0) =
-  Statement(x, type, line)
+Statement(x; expr = x, type = Any, line = 0) =
+  Statement(expr, type, line)
 
-Statement(x::Statement, expr = x.expr; type = x.type, line = x.line) =
+Statement(x::Statement; expr = x.expr, type = x.type, line = x.line) =
   Statement(expr, type, line)
 
 const stmt = Statement
@@ -118,6 +118,11 @@ end
 
 branches(b::Block, c::Integer) = branches(b, block(b.ir, c))
 
+function returnvalue(b::Block)
+  isreturn(branches(b)[end]) || error("Block does not return")
+  return branches(b)[end].args[1]
+end
+
 function argument!(b::Block, value = nothing, type = Any; insert = true, at = length(arguments(b))+1)
   if at < length(arguments(b))
     for i = 1:length(b.ir.defs)
@@ -184,7 +189,7 @@ end
 getindex(b::Block, i::Integer) = basicblock(b).stmts[i]
 getindex(b::Block, i::Variable) = b.ir[i]
 setindex!(b::Block, x::Statement, i::Integer) = (basicblock(b).stmts[i] = x)
-setindex!(b::Block, x, i::Integer) = (b[i] = Statement(b[i], x))
+setindex!(b::Block, x, i::Integer) = (b[i] = Statement(b[i], expr = x))
 
 branch(block::Integer, args...; unless = nothing) =
   Branch(unless, block, Any[args...])
@@ -192,7 +197,10 @@ branch(block::Integer, args...; unless = nothing) =
 branch(block::Block, args...; kw...) = branch(block.id, args...; kw...)
 
 function branch!(b::Block, block, args...; unless = nothing)
-  push!(branches(b), branch(block, args...; unless = unless))
+  brs = branches(b)
+  unless === nothing && deleteat!(brs, findall(br -> br.condition === nothing, brs))
+  args = map(a -> push!(b, a), args)
+  push!(brs, branch(block, args...; unless = unless))
   return b
 end
 
@@ -249,10 +257,10 @@ end
 applyex(f, x) = x
 applyex(f, x::Expr) =
   Expr(x.head, [x isa Expr ? f(x) : x for x in x.args]...)
-applyex(f, x::Statement) = Statement(x, applyex(f, x.expr))
+applyex(f, x::Statement) = Statement(x, expr = applyex(f, x.expr))
 
 function push!(b::Block, x::Statement)
-  x = applyex(a -> push!(b, Statement(a, line = x.line)), x)
+  x = applyex(a -> push!(b, Statement(x, expr = a)), x)
   x = Statement(x)
   push!(basicblock(b).stmts, x)
   push!(b.ir.defs, (b.id, length(basicblock(b).stmts)))
@@ -261,6 +269,9 @@ end
 
 push!(b::Block, x) = push!(b, Statement(x))
 
+push!(b::Block, x::Variable) = x
+
+# TODO make this work on nested Exprs.
 function insert!(b::Block, idx::Integer, x)
   insert!(basicblock(b).stmts, idx, Statement(x))
   for i = 1:length(b.ir.defs)
@@ -290,7 +301,7 @@ end
 
 insertafter!(ir, i, x) = insert!(ir, i, x, after=true)
 
-Base.empty(ir::IR) = IR(copy(ir.lines))
+Base.empty(ir::IR) = IR(copy(ir.lines), meta = ir.meta)
 
 function Base.permute!(ir::IR, perm::AbstractVector)
   explicitbranch!(ir)
@@ -409,3 +420,9 @@ end
 
 argument!(p::Pipe, a...; kw...) =
   substitute!(p, var!(p), argument!(p.to, a...; kw...))
+
+function branch!(ir::Pipe, b, args...; kw...)
+  args = map(a -> postwalk(substitute(ir), a), args)
+  branch!(blocks(ir.to)[end], b, args...; kw...)
+  return ir
+end
