@@ -55,7 +55,7 @@ end
 
 Here it is:
 
-```julia
+```jldoctest main
 julia> using IRTools: IR, @dynamo
 
 julia> @dynamo roundtrip(a...) = IR(a...)
@@ -71,7 +71,7 @@ Here's how it works: our dynamo gets passed a set of *argument types* `a...`. We
 
 In this case, we can easily check that the transformed code produced by `roundtrip` is identical to the original IR for `mul`.
 
-```julia
+```jldoctest main
 julia> using IRTools: @code_ir
 
 julia> @code_ir mul(2, 3)
@@ -87,29 +87,22 @@ julia> @code_ir roundtrip mul(1, 2)
 
 Now we can recreate our `foo` macro. It's a little more verbose since simple symbols like `*` are resolved to `GlobalRef`s in lowered code, but it's broadly the same as our macro.
 
-```julia
-@dynamo function foo(a...)
-  ir = IR(a...)
-  ir = MacroTools.prewalk(ir) do x
-    x isa GlobalRef && x.name == :(*) && return GlobalRef(Base, :+)
-    return x
-  end
-  return ir
-end
+```jldoctest main
+julia> using MacroTools
+
+julia> @dynamo function foo(a...)
+         ir = IR(a...)
+         ir = MacroTools.prewalk(ir) do x
+           x isa GlobalRef && x.name == :(*) && return GlobalRef(Base, :+)
+           return x
+         end
+         return ir
+       end
 ```
 
 It behaves identically, too.
 
-```julia
-# Check it works
-julia> @code_ir foo mul(5, 10)
-1:
-  %1 = _2 + _3
-  return %1
-
-julia> foo(mul, 5, 10)
-15
-
+```jldoctest main
 julia> foo() do
          10*5
        end
@@ -129,22 +122,22 @@ A key difference between macros and dynamos is that dynamos get passed *function
 
 So what if `foo` actually inserted calls to itself when modifying a function? In other words, `prod([1, 2, 3])` would become `foo(prod, [1, 2, 3])`, and so on for each call inside a function. This lets us get the "dynamic extent" property that we talked about earlier.
 
-```julia
-using IRTools: xcall
+```jldoctest main
+julia> using IRTools: xcall
 
-@dynamo function foo2(a...)
-  ir = IR(a...)
-  ir == nothing && return
-  ir = MacroTools.prewalk(ir) do x
-    x isa GlobalRef && x.name == :(*) && return GlobalRef(Base, :+)
-    return x
-  end
-  for (x, st) in ir
-    isexpr(st.expr, :call) || continue
-    ir[x] = xcall(Main, :foo2, st.expr.args...)
-  end
-  return ir
-end
+julia> @dynamo function foo2(a...)
+         ir = IR(a...)
+         ir == nothing && return
+         ir = MacroTools.prewalk(ir) do x
+           x isa GlobalRef && x.name == :(*) && return GlobalRef(Base, :+)
+           return x
+         end
+         for (x, st) in ir
+           isexpr(st.expr, :call) || continue
+           ir[x] = Expr(:call, foo2, st.expr.args...)
+         end
+         return ir
+       end
 ```
 
 There are two changes here: firstly, walking over all IR statements to look for, and modify, `call` expressions. Secondly we handle the case where `ir == nothing`, which can happen when we hit things like intrinsic functions for which there is no source code. If we return `nothing`, the dynamo will just run that function as usual.
@@ -157,18 +150,18 @@ mul_wrapped (generic function with 1 method)
 
 julia> @code_ir mul_wrapped(5, 10)
 1: (%1, %2, %3)
-  %4 = (Main.mul)(%2, %3)
+  %4 = mul(%2, %3)
   return %4
 
 julia> @code_ir foo2 mul_wrapped(5, 10)
 1: (%1, %2, %3)
-  %4 = (Main.foo2)(Main.mul, %2, %3)
+  %4 = (foo2)(mul, %2, %3)
   return %4
 ```
 
 And that it works as expected:
 
-```julia
+```jldoctest main
 julia> foo() do # Does not work (since there is no literal `*` here)
          mul(5, 10)
        end
@@ -186,6 +179,101 @@ julia> foo2() do
 ```
 
 This, we have rewritten the `prod` function to actually calculate `sum`, by *internally* rewriting all calls to `*` to instead use `+`.
+
+## Using Dispatch
+
+We can make our `foo2` dynamo simpler in a couple of ways. Firstly, IRTools provides a built-in utility `recurse!` which makes it easy to recurse into code.
+
+```jldoctest main
+julia> using IRTools: recurse!
+
+julia> @dynamo function foo2(a...)
+         ir = IR(a...)
+         ir == nothing && return
+         ir = MacroTools.prewalk(ir) do x
+           x isa GlobalRef && x.name == :(*) && return GlobalRef(Base, :+)
+           return x
+         end
+         recurse!(ir)
+         return ir
+       end
+
+julia> foo2() do
+         prod([5, 10])
+       end
+15
+```
+
+Secondly, unlike in a macro, we don't actually need to look through source code for literal references to the `*` function. Because our dynamo is a normal function, we can actually use dispatch to decide what specific functions should do.
+
+```jldoctest main
+julia> foo3(::typeof(*), a, b) = a+b
+foo3 (generic function with 1 method)
+
+julia> foo3(*, 5, 10)
+15
+```
+
+Now we can define a simpler version of `foo3` which *only* recurses, and let dispatch figure out when to turn `*`s into `+`s.
+
+```jldoctest main
+julia> @dynamo function foo3(a...)
+         ir = IR(a...)
+         ir == nothing && return
+         recurse!(ir)
+         return ir
+       end
+
+julia> foo3() do
+         prod([5, 10])
+       end
+15
+```
+
+## Contexts
+
+We can achieve some interesting things by making our dynamo a *closure*, i.e. a callable object capable of holding some state. For example, consider an object which simply records a count.
+
+```jldoctest counter
+julia> mutable struct Counter
+         count::Int
+       end
+
+julia> Counter() = Counter(0)
+Counter
+
+julia> count!(c::Counter) = (c.count += 1)
+count! (generic function with 1 method)
+```
+
+We can turn this into a dynamo which inserts a single statement into the IR of each function, to increase the count by one.
+
+```jldoctest counter
+julia> using IRTools: @dynamo, IR, self, recurse!
+
+julia> @dynamo function (c::Counter)(m...)
+         ir = IR(m...)
+         ir == nothing && return
+         recurse!(ir)
+         pushfirst!(ir, Expr(:call, count!, self))
+         return ir
+       end
+```
+
+Now we can count how many function calls that happen in a given block of code.
+
+```jldoctest counter
+julia> c = Counter()
+Counter(0)
+
+julia> c() do
+         1 + 2.0
+       end
+3.0
+
+julia> c.count
+18
+```
 
 !!! warning
 
