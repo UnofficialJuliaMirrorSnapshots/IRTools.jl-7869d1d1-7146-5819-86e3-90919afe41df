@@ -78,6 +78,7 @@ Base.copy(bb::BasicBlock) = BasicBlock(copy(bb.stmts), copy(bb.args), copy(bb.ar
 
 branches(bb::BasicBlock) = bb.branches
 arguments(bb::BasicBlock) = bb.args
+argtypes(bb::BasicBlock) = bb.argtypes
 
 """
     IR()
@@ -119,9 +120,9 @@ function block!(ir::IR, i = length(blocks(ir))+1)
       br = branches(b)[i]
       br.block >= i && (branches(b)[i] = Branch(br, block = br.block+1))
     end
-  end
-  for (ii, (b, j)) = enumerate(ir.defs)
-    b >= i && (ir.defs[ii] = (b+1, j))
+    for (ii, (b, j)) = enumerate(ir.defs)
+      b >= i && (ir.defs[ii] = (b+1, j))
+    end
   end
   return block(ir, i)
 end
@@ -135,6 +136,9 @@ basicblock(b::Block) = b.ir.blocks[b.id]
 branches(b::Block) = branches(basicblock(b))
 arguments(b::Block) = arguments(basicblock(b))
 arguments(ir::IR) = arguments(block(ir, 1))
+
+argtypes(b::Block) = argtypes(basicblock(b))
+argtypes(ir::IR) = argtypes(block(ir, 1))
 
 canbranch(bb::Block) = length(branches(bb)) == 0 || isconditional(branches(bb)[end])
 
