@@ -37,6 +37,8 @@ isconditional(b::Branch) = b.condition != nothing
 Base.:(==)(a::Branch, b::Branch) =
   (a.condition, a.block, a.args) == (b.condition, b.block, b.args)
 
+Base.copy(br::Branch) = Branch(br.condition, br.block, copy(br.args))
+
 arguments(b::Branch) = b.args
 
 const unreachable = Branch(nothing, 0, [])
@@ -75,7 +77,7 @@ end
 
 BasicBlock(stmts = []) = BasicBlock(stmts, [], [], Branch[])
 
-Base.copy(bb::BasicBlock) = BasicBlock(copy(bb.stmts), copy(bb.args), copy(bb.argtypes), copy(bb.branches))
+Base.copy(bb::BasicBlock) = BasicBlock(copy(bb.stmts), copy(bb.args), copy(bb.argtypes), copy.(bb.branches))
 
 branches(bb::BasicBlock) = bb.branches
 arguments(bb::BasicBlock) = bb.args
@@ -117,15 +119,30 @@ length(ir::IR) = sum(x -> x[2] > 0, ir.defs)
 function block!(ir::IR, i = length(blocks(ir))+1)
   insert!(ir.blocks, i, BasicBlock())
   if i != length(blocks(ir))
-    for b in blocks(ir), i = 1:length(branches(b))
-      br = branches(b)[i]
-      br.block >= i && (branches(b)[i] = Branch(br, block = br.block+1))
+    for b in blocks(ir), bi = 1:length(branches(b))
+      br = branches(b)[bi]
+      br.block >= i && (branches(b)[bi] = Branch(br, block = br.block+1))
     end
     for (ii, (b, j)) = enumerate(ir.defs)
       b >= i && (ir.defs[ii] = (b+1, j))
     end
   end
   return block(ir, i)
+end
+
+function deleteblock!(ir::IR, i::Integer)
+  deleteat!(ir.blocks, i)
+  if i != length(blocks(ir))+1
+    for b in blocks(ir), bi = 1:length(branches(b))
+      br = branches(b)[bi]
+      br.block >= i && (branches(b)[bi] = Branch(br, block = br.block-1))
+    end
+  end
+  for (ii, (b, j)) = enumerate(ir.defs)
+    b == i && (ir.defs[ii] = (-1, -1))
+    b > i && (ir.defs[ii] = (b-1, j))
+  end
+  return
 end
 
 struct Block
@@ -184,6 +201,8 @@ function returnvalue(b::Block)
   return returnvalue(branches(b)[end])
 end
 
+returntype(b::Block) = exprtype(b.ir, returnvalue(b))
+
 """
     argument!(block, [value, type])
 
@@ -235,9 +254,10 @@ function emptyargs!(b::Block)
   return
 end
 
-function deletearg!(b::Block, i)
+function deletearg!(b::Block, i::Integer)
   arg = arguments(b)[i]
   deleteat!(arguments(b), i)
+  deleteat!(argtypes(b), i)
   for c in blocks(b.ir), br in branches(c)
     br.block == b.id && deleteat!(arguments(br), i)
   end
@@ -334,7 +354,7 @@ length(b::Block) = count(x -> x[1] == b.id, b.ir.defs)
 function successors(b::Block)
   brs = basicblock(b).branches
   succs = Int[br.block for br in brs if br.block > 0]
-  all(br -> br.condition != nothing, brs) && push!(succs, b.id+1)
+  all(br -> br.condition != nothing, brs) && b.id < length(blocks(b.ir)) && push!(succs, b.id+1)
   return [block(b.ir, succ) for succ in succs]
 end
 
@@ -542,6 +562,18 @@ function Base.permute!(ir::IR, perm::AbstractVector)
     branches(b)[i].block > 0 || continue
     br = branches(b)[i]
     branches(b)[i] = Branch(br, block = iperm[br.block])
+  end
+  return ir
+end
+
+function IR(b::Block)
+  ir = IR(copy(b.ir.defs), [copy(basicblock(b))], b.ir.lines, b.ir.meta)
+  for i in 1:length(ir.defs)
+    if ir.defs[i][1] == b.id
+      ir.defs[i] = (1, ir.defs[i][2])
+    else
+      ir.defs[i] = (-1, -1)
+    end
   end
   return ir
 end
