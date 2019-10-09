@@ -40,8 +40,8 @@ function reloop_loop(cfg::CFG, blocks, entry, done)
   body = filter(b -> any(e -> e in rs[b], entry), blocks)
   next = setdiff(blocks, body)
   Loop(reloop(cfg, blocks = body, entry = entry, done = union(done, entry)),
-       reloop(cfg, blocks = next, entry = union([intersect(rs[b], next) for b in body]...), done = done))
- end
+       reloop(cfg, blocks = next, entry = union([intersect(cfg[b], next) for b in body]...), done = done))
+end
 
 function reloop(cfg::CFG; blocks = 1:length(cfg.graph), entry = [1], done = Int[])
   (isempty(blocks) || isempty(entry)) && return
@@ -105,76 +105,122 @@ end
 
 # AST Conversion
 
+rename(env, ex) =
+  prewalk(x -> x isa Variable ? env[x] :
+          x isa Slot ? Symbol(x.id) :
+          x, ex)
+
 entry(s::Simple) = [s.block]
 entry(s::Loop) = entry(s.inner)
 entry(s::Multiple) = union(entry.(s.inner)...)
+entry(s::Nothing) = Int[]
 
-lower(ir, v::Variable; args) =
-  haskey(args, v) ? args[v] : postwalk(v -> lower(ir, v; args=args), ir[v].expr)
+struct ASTCtx
+  ir::IR
+  args::Dict{Variable,Symbol}
+  branches::Dict{Any,Any}
+  inline::Bool
+end
 
-lower(ir, s::Slot; args) = Symbol(:slot, s.id)
-lower(ir, v; args) = v
-
-function ast(b::Block, args)
+function ast(cx::ASTCtx, b::Block)
   usages = Dict()
   prewalk(b) do x
     x isa Variable && (usages[x] = get(usages, x, 0)+1)
     x
   end
   exs = []
+  env = Dict{Any,Any}(cx.args)
   for v in keys(b)
-    get(usages, v, 0) == 0 && push!(exs, lower(b, v; args = args))
+    ex = b[v].expr
+    if cx.inline && get(usages, v, 0) == 1 && !(ex isa Slot) # TODO not correct
+      env[v] = rename(env, ex)
+    elseif get(usages, v, 0) == 0
+      isexpr(ex) && push!(exs, rename(env, ex))
+    else
+      tmp = gensym("tmp")
+      push!(exs, :($tmp = $(rename(env, ex))))
+      env[v] = tmp
+    end
   end
-  return exs
+  return exs, env
 end
 
-ast(ir::IR, ::Nothing; args, branches = Dict()) = nothing
+ast(cx::ASTCtx, ::Nothing) = @q (;)
 
-function ast(ir::IR, cfg::Simple; args, branches = Dict())
-  b = block(ir, cfg.block)
-  exs = ast(b, args)
-  x = :nothing
-  for br in reverse(IRTools.branches(b))
-    y = isreturn(br) ?
-      Expr(:return, lower(ir, returnvalue(br), args = args)) :
-      :(__label__ = $(br.block))
-    haskey(branches, br.block) && (y = @q ($y; $(Expr(branches[br.block]))))
-    isconditional(br) ? (x = :($(lower(ir, br.condition, args=args)) ? $x : $y)) :
-      x = y
+function ast(cx::ASTCtx, cfg::Simple)
+  b = block(cx.ir, cfg.block)
+  exs, env = ast(cx, b)
+  function nextblock(br)
+    if isreturn(br)
+      @q (return $(rename(env, returnvalue(br)));)
+    elseif haskey(cx.branches, br.block)
+      cx.branches[br.block] == :continue && cfg.next == nothing ? @q((;)) :
+        @q ($(Expr(cx.branches[br.block]));)
+    elseif cfg.next isa Multiple && br.block in entry(cfg.next)
+      n = findfirst(i -> br.block in entry(i), cfg.next.inner)
+      ast(cx, cfg.next.inner[n])
+    elseif cfg.next isa Multiple && br.block in entry(cfg.next.next)
+      ast(cx, cfg.next.next)
+    elseif br.block in entry(cfg.next)
+      ast(cx, cfg.next)
+    else
+      @q (;)
+    end
   end
-  push!(exs, x)
-  @q begin
-    $(exs...)
-    $(ast(ir, cfg.next, args = args, branches = branches))
+  @assert length(branches(b)) <= 2 "No more than 2 branches supported, currently."
+  ex = if length(branches(b)) == 1
+    @q begin
+      $(exs...)
+      $(nextblock(branches(b)[1]).args...)
+    end
+  else
+    @q begin
+      $(exs...)
+      if $(rename(env, branches(b)[1].condition))
+        $(nextblock(branches(b)[2]).args...)
+      else
+        $(nextblock(branches(b)[1]).args...)
+      end
+    end
   end
+  cfg.next isa Multiple && (ex = @q ($(ex.args...); $(ast(cx, cfg.next.next).args...)))
+  return ex
 end
 
-function ast(ir::IR, cfg::Multiple; args, branches = Dict())
-  conds = [:(__label__ == $(s.block)) for s in cfg.inner]
-  body = [ast(ir, s, args = args, branches = branches) for s in cfg.inner]
-  ex = Expr(:elseif, conds[end], body[end])
-  ex = foldr((i, x) -> Expr(:elseif, conds[i], body[i], x), 1:length(conds)-1, init = ex)
-  ex.head = :if
-  return @q ($ex; $(ast(ir, cfg.next; args = args, branches = branches)))
+function ast(cx::ASTCtx, cfg::Multiple)
+  error("Only structured control flow is currently supported.")
 end
 
-function ast(ir::IR, cfg::Loop; args, branches = Dict())
+function ast(cx::ASTCtx, cfg::Loop)
   for e in entry(cfg)
-    branches[e] = :continue
+    cx.branches[e] = :continue
   end
   for e in entry(cfg.next)
-    branches[e] = :break
+    cx.branches[e] = :break
   end
-  @q begin
-    while true
-      $(ast(ir, cfg.inner, args = args, branches = branches))
+  brs = branches(block(cx.ir, cfg.inner.block))
+  if length(brs) == 2 && brs[1].block in entry(cfg.next) && brs[2].block in entry(cfg.inner.next)
+    exs, env = ast(cx, block(cx.ir, cfg.inner.block))
+    cond = unblock(@q ($(exs...); $(rename(env, brs[1].condition))))
+    @q begin
+      while $cond
+        $(ast(cx, cfg.inner.next).args...)
+      end
+      $(ast(cx, cfg.next).args...)
     end
-    $(ast(ir, cfg.next, args = args, branches = branches))
+  else
+    @q begin
+      while true
+        $(ast(cx, cfg.inner).args...)
+      end
+      $(ast(cx, cfg.next).args...)
+    end
   end
 end
 
-function reloop(ir::IR)
+function reloop(ir::IR; inline = true)
+  ir = explicitbranch!(copy(ir))
   cfg = reloop(CFG(ir))
   args = Dict(v => Symbol(:arg, i) for (i, v) in enumerate(arguments(ir)))
-  ast(ir, cfg, args = args)
+  ast(ASTCtx(ir, args, Dict(), inline), cfg)
 end

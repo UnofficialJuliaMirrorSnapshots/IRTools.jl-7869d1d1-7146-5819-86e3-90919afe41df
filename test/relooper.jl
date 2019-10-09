@@ -26,6 +26,16 @@ pow_cfg = CFG(@code_ir pow(2, 3))
 
 # AST recovery
 
+relu(x) = (y = x > 0 ? x : 0)
+
+ir = explicitbranch!(IR(@meta(relu(1)), slots = true))
+ex = reloop(ir)
+
+@test eval(:(let arg2 = 5; $ex; end)) == 5
+@test eval(:(let arg2 = -5; $ex; end)) == 0
+
+relu(x) = x > 0 ? x : 0
+
 ir = explicitbranch!(IR(@meta(relu(1)), slots = true))
 ex = reloop(ir)
 
@@ -40,4 +50,4 @@ ex = reloop(ir)
 ir = explicitbranch!(IR(@meta(gcd(1,1)), slots = true))
 ex = reloop(ir)
 
-@test_broken eval(:(let arg2 = 85, arg3 = 391; $ex; end)) == gcd(85, 391)
+@test eval(:(let arg2 = 85, arg3 = 391; $ex; end)) == gcd(85, 391)
